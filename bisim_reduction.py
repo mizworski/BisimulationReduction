@@ -1,4 +1,6 @@
+import argparse
 import re
+
 from pyspark.sql import SparkSession
 from pyspark.sql import Row
 from pyspark.sql.functions import lit
@@ -20,8 +22,13 @@ def read_input(input_path, spark):
     nodes = [Node(node, 0, 0) for node in range(nodes_num)]
 
     for line in lines[1: edges_num + 1]:
-      t_m = re.match('^[ \t]*\([ \t]*(\d+)[ \t]*,[ \t]*"?([a-zA-Z][a-zA-Z0-9_]*)"?[ \t]*,[ \t]*(\d+)[ \t]*\)', line)
+      t_m = re.match('^[ \t]*\([ \t]*(\d+)[ \t]*,'
+                     '[ \t]*([a-zA-Z][a-zA-Z0-9_]*|\"[ !\x23-\x7E]+\")[ \t]*,'
+                     '[ \t]*(\d+)[ \t]*\)', line)
       source, e_label, target = int(t_m.group(1)), t_m.group(2), int(t_m.group(3))
+      if e_label.startswith("\""):
+        e_label = e_label[1:-1]
+
       edges.append(Edge(source, target, e_label, 0))
 
     nodes_df = spark.createDataFrame(nodes)
@@ -99,6 +106,35 @@ def task_repartition(table, spark):
   return spark.createDataFrame(sorted_table, ['n_id', 'p_id_0', 'p_id_new'])
 
 
+def calculate_p_id_k(nodes, edges, k, spark, verbose=0):
+  t1 = task_signature(nodes, edges)
+
+  if verbose == 2:
+    print("ITERATION {}".format(k))
+    print("After signature task.")
+    for row in t1.take(100):
+      print(row)
+
+  t2 = task_identifier(t1)
+
+  if verbose == 2:
+    print("After identifier task.")
+    for row in t2.take(100):
+      print(row)
+
+  nodes_new = task_repartition(t2, spark)
+
+  if verbose == 2:
+    print("After repartiton task:")
+    for row in nodes_new.rdd.take(100):
+      print(row)
+
+  if verbose:
+    nodes_new.show()
+
+  return nodes_new
+
+
 def save_results(nodes, edges, output_file_path):
   edges_reduced = edges \
     .join(nodes, edges.s_id == nodes.n_id) \
@@ -113,7 +149,7 @@ def save_results(nodes, edges, output_file_path):
   new_p_ids = {p_id: i + 1 for i, p_id in enumerate(assigned_p_ids) if p_id != 0}
   new_p_ids[0] = 0
 
-  edges = edges_reduced.toPandas().drop_duplicates()
+  edges = edges_reduced.toPandas().drop_duplicates().sort_values(['s_id_new', 't_id_new', 'e_label'])
 
   initial_state, edges_num, nodes_num = 0, len(edges), len(assigned_p_ids)
 
@@ -125,61 +161,49 @@ def save_results(nodes, edges, output_file_path):
 
 
 def main():
-  input_path = 'data/ex5.aut'
-  output_file_path = 'data/ex5_reduced.aut'
-  verbose = 0
-  k_bisimiar = 8
+  parser = argparse.ArgumentParser(description="Bisimulation Reduction of Big Graphs on MapReduce.")
+  parser.add_argument("-i", "--input_path", default="data/ex1.aut", type=str,
+                      help="Path to input file with graph in AUT format.")
+  parser.add_argument("-o", "--output_path", default="data/ex1_reduced.aut", type=str,
+                      help="Path to output file where reduced graph will be saved in AUT format.")
+  parser.add_argument("-k", "--k_bisimiar", default=8, type=int,
+                      help="Partition id will be calculated up to k bisimilarity.")
+  parser.add_argument("-v", "--verbose", default=0, type=int,
+                      help="Set to 0 for no logging, 1 for basic logging (N_t table only), 2 for full logging.")
+  args = parser.parse_args()
+
 
   spark = SparkSession \
     .builder \
-    .appName("Bisimulation Reduction of Big Graphs on MapReduce") \
+    .appName("Bisimulation Reduction of Big Graphs on MapReduce.") \
     .getOrCreate()
 
-  nodes, edges = read_input(input_path, spark)
+  # Notice: I don't allow using double quote character in label name (even though it's allowed in AUT format).
+  # Other characters in ASCII range [32, 126] are allowed in quoted <quoted-label>.
+  nodes, edges = read_input(args.input_path, spark)
 
-  if verbose:
+  if args.verbose:
     nodes.show()
 
-  if verbose == 2:
+  if args.verbose == 2:
     print("Nodes as input.")
     for row in nodes.rdd.take(100):
       print(row)
 
-  for k in range(k_bisimiar):
-    t1 = task_signature(nodes, edges)
+  # In case k_bisimiar was set to 0
+  nodes_new = nodes
 
-    if verbose == 2:
-      print("ITERATION {}".format(k))
-      print("After signature task.")
-      for row in t1.take(100):
-        print(row)
-
-    t2 = task_identifier(t1)
-
-    if verbose == 2:
-      print("After identifier task.")
-      for row in t2.take(100):
-        print(row)
-
-    nodes_new = task_repartition(t2, spark)
-
-    if verbose == 2:
-      print("After repartiton task:")
-      for row in nodes_new.rdd.take(100):
-        print(row)
-
-    if verbose:
-      nodes_new.show()
+  for k in range(args.k_bisimiar):
+    nodes_new = calculate_p_id_k(nodes, edges, k, spark, args.verbose)
 
     # Check if p_id_k function has changed.
     # In 'nodes' table only p_id_new column is being changed (it represents p_id_k after k iterations).
-    res = nodes.subtract(nodes_new)
-    if res.rdd.isEmpty():
+    if nodes.subtract(nodes_new).rdd.isEmpty():
       break
+    else:
+      nodes = nodes_new
 
-    nodes = nodes_new
-
-  save_results(nodes, edges, output_file_path)
+  save_results(nodes_new, edges, args.output_path)
   spark.stop()
 
 
