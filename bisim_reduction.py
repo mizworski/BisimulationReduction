@@ -1,3 +1,8 @@
+# Michal Izworski, 360968
+# Algorithm that for LTS A returns LTS B, which is result of division A by relation of greatest bisimulation for A.
+# Based on paper by: Yongming Luo, Yannick de Lange, George H. L. Fletcher, Paul De Bra, Jan Hidders, and Yuqing Wu.
+# "Bisimulation reduction of big graphs on mapreduce".
+
 import argparse
 import re
 
@@ -19,6 +24,11 @@ def read_input(input_path, spark):
 
     edges = []
 
+    # Note that p_id_0 is always set to 0 for all vertices.
+    # This field could be removed from algorithm and everything would work fine.
+    # However I left this field and implemented more general algorithm (as it was described in provided paper).
+    # Which means that if 'nodes.p_id_0' was set to arbitrary function, my algorithm would still be correct.
+    # In my case node label function is following: \lambda_N(x) = 0 \forall_x.
     nodes = [Node(node, 0, 0) for node in range(nodes_num)]
 
     for line in lines[1: edges_num + 1]:
@@ -42,10 +52,12 @@ def read_input(input_path, spark):
 
 def task_signature(nodes, edges):
   def create_signature(values):
-    # Check if values represent node.
+    # Check if values represent node or edge.
     if values[0] == '0':
+      # values represent node.
       return values[1], frozenset([])
     else:
+      # values represent edge.
       return None, frozenset({(values[0], values[2])})
 
   def merge_val(sig, values):
@@ -145,8 +157,9 @@ def save_results(nodes, edges, output_file_path):
     .select(['s_id_new', 'e_label', 't_id_new'])
 
   nodes = nodes.toPandas()
-  assigned_p_ids = set(nodes['p_id_new'])
-  new_p_ids = {p_id: i + 1 for i, p_id in enumerate(assigned_p_ids) if p_id != 0}
+  # I want to make sure that 0 is mapped onto 0.
+  assigned_p_ids = set(nodes['p_id_new']).difference({0})
+  new_p_ids = {p_id: i + 1 for i, p_id in enumerate(assigned_p_ids)}
   new_p_ids[0] = 0
 
   edges = edges_reduced.toPandas().drop_duplicates().sort_values(['s_id_new', 't_id_new', 'e_label'])
@@ -157,21 +170,22 @@ def save_results(nodes, edges, output_file_path):
     out_file.write("des ({}, {}, {})\n".format(initial_state, edges_num, nodes_num))
 
     for _, edge in edges.iterrows():
-      out_file.write("({}, {}, {})\n".format(edge['s_id_new'], edge['e_label'], edge['t_id_new']))
+      remapped_s_id = new_p_ids[edge['s_id_new']]
+      remapped_t_id = new_p_ids[edge['t_id_new']]
+      out_file.write("({}, {}, {})\n".format(remapped_s_id, edge['e_label'], remapped_t_id))
 
 
 def main():
   parser = argparse.ArgumentParser(description="Bisimulation Reduction of Big Graphs on MapReduce.")
-  parser.add_argument("-i", "--input_path", default="data/ex1.aut", type=str,
+  parser.add_argument("-i", "--input_path", default="data/ex7.aut", type=str,
                       help="Path to input file with graph in AUT format.")
-  parser.add_argument("-o", "--output_path", default="data/ex1_reduced.aut", type=str,
+  parser.add_argument("-o", "--output_path", default="data/reduced_ex7.aut", type=str,
                       help="Path to output file where reduced graph will be saved in AUT format.")
   parser.add_argument("-k", "--k_bisimiar", default=8, type=int,
                       help="Partition id will be calculated up to k bisimilarity.")
   parser.add_argument("-v", "--verbose", default=0, type=int,
                       help="Set to 0 for no logging, 1 for basic logging (N_t table only), 2 for full logging.")
   args = parser.parse_args()
-
 
   spark = SparkSession \
     .builder \
@@ -190,14 +204,14 @@ def main():
     for row in nodes.rdd.take(100):
       print(row)
 
-  # In case k_bisimiar was set to 0
+  # In case 'k_bisimiar' was set to 0.
   nodes_new = nodes
 
   for k in range(args.k_bisimiar):
     nodes_new = calculate_p_id_k(nodes, edges, k, spark, args.verbose)
 
-    # Check if p_id_k function has changed.
-    # In 'nodes' table only p_id_new column is being changed (it represents p_id_k after k iterations).
+    # Check if p_id_k function has changed (column 'p_id_new').
+    # If it didn't then it means that we reached k for which \forall_{k'>k} \forall_x p_id_k'(x) == p_id_k(x) [without proof]
     if nodes.subtract(nodes_new).rdd.isEmpty():
       break
     else:
